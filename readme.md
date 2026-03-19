@@ -21,6 +21,8 @@ Wind-Power-Q-A/
 │   ├── dto/                 # 数据传输对象
 │   │   ├── ChatMessage.java
 │   │   ├── ChatResponse.java
+│   │   ├── KnowledgeRebuildTask.java
+│   │   ├── KnowledgeRebuildStatus.java
 │   │   ├── TurbineQueryDTO.java
 │   │   └── TitleSection.java
 │   ├── service/             # 服务层
@@ -32,6 +34,8 @@ Wind-Power-Q-A/
 │   │   ├── EnhancedRAGService.java
 │   │   ├── HyDEService.java
 │   │   ├── KnowledgeBaseIngestionService.java
+│   │   ├── KnowledgeRebuildConsumer.java
+│   │   ├── KnowledgeRebuildProducer.java
 │   │   ├── QueryRewriteService.java
 │   │   ├── RagCacheService.java
 │   │   └── TurbineMonitorDataService.java
@@ -235,6 +239,85 @@ public void handleDeadLetter(ChatMessage message) {
 }
 ```
 
+#### 4.4 异步知识库重建
+
+知识库重建是一个耗时的操作，使用 RabbitMQ 实现异步重建，确保用户在重建过程中可以继续进行对话等操作。
+
+**架构设计**：
+
+```
+┌─────────────┐    ┌──────────────────┐    ┌─────────────────┐
+│   Client    │───▶│  Rebuild Queue   │───▶│    Consumer     │
+│ (触发重建)   │    │ (knowledge.queue)│    │  (后台处理重建)  │
+└─────────────┘    └──────────────────┘    └────────┬────────┘
+                                                    │
+                     ┌──────────────────┐           │
+                     │   Status Queue   │◀──────────┘
+                     │  (进度更新消息)   │
+                     └────────┬─────────┘
+                              │
+                     ┌────────▼─────────┐
+                     │     Client       │
+                     │  (轮询查询状态)   │
+                     └──────────────────┘
+```
+
+**核心组件**：
+
+| 组件 | 说明 |
+|-----|------|
+| `KnowledgeRebuildTask` | 重建任务 DTO，包含任务ID、类型等信息 |
+| `KnowledgeRebuildStatus` | 重建状态 DTO，包含进度、状态、耗时等 |
+| `KnowledgeRebuildProducer` | 生产者服务，提交任务和查询状态 |
+| `KnowledgeRebuildConsumer` | 消费者服务，异步执行重建任务 |
+
+**使用示例**：
+
+```java
+// 1. 提交异步重建任务
+POST /api/knowledge/async/clear-and-rebuild
+响应: {"success": true, "taskId": "xxx-xxx-xxx", "message": "任务已提交"}
+
+// 2. 轮询查询状态
+GET /api/knowledge/async/status/xxx-xxx-xxx
+响应: {
+    "success": true,
+    "status": "RUNNING",
+    "progress": 45,
+    "currentStep": "正在处理文档 (5/10)",
+    "totalDocuments": 10,
+    "processedDocuments": 5
+}
+
+// 3. 任务完成
+响应: {
+    "success": true,
+    "status": "COMPLETED",
+    "progress": 100,
+    "currentStep": "处理完成",
+    "durationMs": 45000
+}
+```
+
+**状态流转**：
+
+```
+PENDING → RUNNING → COMPLETED
+                   ↘ FAILED
+```
+
+| 状态 | 说明 |
+|-----|------|
+| `PENDING` | 任务已提交，等待处理 |
+| `RUNNING` | 任务正在执行中 |
+| `COMPLETED` | 任务执行成功 |
+| `FAILED` | 任务执行失败 |
+
+**并发控制**：
+- 同一时间只允许一个重建任务运行
+- 提交新任务时会检查是否有正在运行的任务
+- 状态信息存储在 Redis 中，支持分布式环境
+
 ### 5. 分级降级机制
 
 #### 5.1 降级级别
@@ -327,8 +410,12 @@ public Flux<String> chatStream(String memoryId, Map<String, String> payload) {
 
 | 方法 | 路径 | 说明 |
 |-----|------|------|
-| POST | `/api/knowledge/rebuild` | 追加模式重建知识库 |
-| POST | `/api/knowledge/clear-and-rebuild` | 清空后重建知识库 |
+| POST | `/api/knowledge/rebuild` | 追加模式重建知识库（同步） |
+| POST | `/api/knowledge/clear-and-rebuild` | 清空后重建知识库（同步） |
+| POST | `/api/knowledge/async/rebuild` | 异步追加模式重建知识库 |
+| POST | `/api/knowledge/async/clear-and-rebuild` | 异步清空后重建知识库 |
+| GET | `/api/knowledge/async/status` | 获取当前重建任务状态 |
+| GET | `/api/knowledge/async/status/{taskId}` | 获取指定任务状态 |
 
 ### 降级管理
 

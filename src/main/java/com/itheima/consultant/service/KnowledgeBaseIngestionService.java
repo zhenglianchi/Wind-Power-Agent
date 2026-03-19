@@ -28,6 +28,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Stream;
+import java.util.function.BiConsumer;
 
 @Slf4j
 @Service
@@ -133,6 +134,79 @@ public class KnowledgeBaseIngestionService {
 
         log.info("正在向量化并存入 Redis...");
         ingestor.ingest(documents);
+        log.info("存入成功！");
+
+        eventPublisher.publishEvent(new KnowledgeBaseUpdateEvent(this, "INGEST", documents.size() + " documents"));
+    }
+
+    public void ingestPdfDocumentsWithCallback(BiConsumer<Integer, Integer> progressCallback) throws IOException {
+        Path directoryPath = Paths.get(pdfPath).toAbsolutePath();
+
+        if (!Files.exists(directoryPath)) {
+            log.warn("PDF 目录不存在：{}, 跳过知识库构建", directoryPath);
+            if (progressCallback != null) {
+                progressCallback.accept(0, 0);
+            }
+            return;
+        }
+
+        log.info("开始加载 PDF 文档，目录: {}", directoryPath);
+
+        List<Document> documents = new ArrayList<>();
+        DocumentParser parser = new ApachePdfBoxDocumentParser();
+
+        try (Stream<Path> paths = Files.walk(directoryPath)) {
+            paths.filter(Files::isRegularFile)
+                 .filter(path -> path.toString().toLowerCase().endsWith(".pdf"))
+                 .forEach(path -> {
+                     try {
+                         log.info("📄 加载文档: {}", path.getFileName());
+
+                         Document document = FileSystemDocumentLoader.loadDocument(path, parser);
+
+                         Metadata metadata = document.metadata();
+                         metadata.put("source", path.getFileName().toString());
+                         metadata.put("absolute_path", path.toString());
+
+                         Document documentWithSource = Document.from(document.text(), metadata);
+                         documents.add(documentWithSource);
+
+                     } catch (Exception e) {
+                         log.error("❌ 加载文档失败: {}", path, e);
+                     }
+                 });
+        }
+
+        if (documents.isEmpty()) {
+            log.warn("未找到任何 PDF 文档");
+            if (progressCallback != null) {
+                progressCallback.accept(0, 0);
+            }
+            return;
+        }
+
+        log.info("共加载 {} 个文档", documents.size());
+
+        DocumentSplitter splitter = createSplitter();
+
+        EmbeddingStoreIngestor ingestor = EmbeddingStoreIngestor.builder()
+                .documentSplitter(splitter)
+                .embeddingModel(embeddingModel)
+                .embeddingStore(embeddingStore)
+                .build();
+
+        log.info("正在向量化并存入 Redis...");
+
+        int total = documents.size();
+        for (int i = 0; i < documents.size(); i++) {
+            Document doc = documents.get(i);
+            ingestor.ingest(List.of(doc));
+
+            if (progressCallback != null) {
+                progressCallback.accept(i + 1, total);
+            }
+        }
+
         log.info("存入成功！");
 
         eventPublisher.publishEvent(new KnowledgeBaseUpdateEvent(this, "INGEST", documents.size() + " documents"));

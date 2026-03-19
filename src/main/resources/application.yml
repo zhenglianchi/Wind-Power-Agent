@@ -1,0 +1,178 @@
+langchain4j:
+  open-ai:
+    chat-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: 1234567890
+      model-name: qwen-plus
+      log-requests: true
+      log-responses: true
+    streaming-chat-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: 1234567890
+      model-name: qwen-plus
+      log-requests: true
+      log-responses: true
+    embedding-model:
+      base-url: https://dashscope.aliyuncs.com/compatible-mode/v1
+      api-key: 1234567890
+      model-name: text-embedding-v3
+      log-requests: true
+      log-responses: true
+      max-segments-per-batch: 10
+    rerank-model:
+      base-url: https://dashscope.aliyuncs.com/api/v1/services/rerank
+      api-key: 1234567890
+      model-name: gte-rerank-v2
+      log-requests: true
+      log-responses: true
+
+  community:
+    redis:
+      host: localhost
+      port: 6379
+    embedding-store:
+      index-name: wind-farm-knowledge
+      dimension: 1536
+      use-filter: true
+
+logging:
+  level:
+    dev.langchain4j: debug
+    com.itheima.consultant: debug
+
+aliyun:
+  docmind:
+    enabled: true
+    access-key-id: 1234567890
+    access-key-secret: 1234567890
+    timeout-seconds: 300
+    poll-interval-seconds: 5
+
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/wind_farm_db?serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true
+    username: root
+    password: root
+  webflux:
+    max-in-memory-size: 10MB
+
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
+    listener:
+      simple:
+        acknowledge-mode: auto
+        prefetch: 1
+
+
+mybatis:
+  configuration:
+    map-underscore-to-camel-case: true
+
+rag:
+  pdf-path: Wind-Power-Q-A/src/main/resources/content
+  auto-init: false
+  index-name: embedding-index
+  chunk-size: 800
+  chunk-overlap: 200
+
+  splitter:
+    strategy: ALIYUN_SMART
+    title:
+      max-section-size: 2000
+      enable-sub-split: true
+
+  retrieval:
+    top-k-recall: 20
+    min-score: 0.6
+    keyword-top-k: 20
+    keyword-min-score: 0.1
+    rrf-k: 15
+    top-k-final: 5
+    rerank-threshold: 0.3
+    keyword:
+      fuzzy-enabled: true
+
+  memory:
+    short-term:
+      window-size: 10
+      window-ttl-days: 1
+    inject-long-term: true
+    archive-ttl-days: 30
+
+  rerank:
+    api-path: "/text-rerank/text-rerank"
+
+  turbine:
+    default-limit: 50
+    fault-limit: 100
+
+  cache:
+    enabled: true
+    l1:
+      max-size: 50
+      expire-minutes: 5
+    l2:
+      expire-minutes: 60
+      key-prefix: "rag:cache:answer:"
+    penetration:
+      enabled: true
+      null-expire-seconds: 60
+    breakdown:
+      enabled: true
+      lock-wait-ms: 100
+      lock-expire-seconds: 10
+    avalanche:
+      enabled: true
+      random-range-seconds: 300
+
+  degradation:
+    level: NORMAL
+    rag-enabled: true
+    cache-enabled: true
+    tool-enabled: true
+    fallback-message: "系统当前处于降级模式，部分功能暂时不可用，请稍后再试。"
+
+  query-rewrite:
+    enabled: true
+    expand-queries: true
+
+  hyde:
+    enabled: true
+    hypothetical-count: 1
+    search-top-k: 5
+    min-score: 0.5
+
+  enhanced:
+    enabled: true
+    use-query-rewrite: true
+    use-hyde: true
+    merge-strategy: UNION
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: wind-power-qa
+
+rabbitmq:
+  chat:
+    concurrency: 5
+    max-concurrency: 20
+    prefetch: 2
+    queue-max-length: 10000

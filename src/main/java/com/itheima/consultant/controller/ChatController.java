@@ -2,6 +2,7 @@ package com.itheima.consultant.controller;
 
 import com.itheima.consultant.aiservice.WindFarmAssistant;
 import com.itheima.consultant.config.DegradationConfig;
+import com.itheima.consultant.dto.ChatResponse;
 import com.itheima.consultant.service.ChatMessageProducer;
 import com.itheima.consultant.service.DegradationService;
 import com.itheima.consultant.service.RagCacheService;
@@ -18,7 +19,6 @@ import reactor.core.publisher.Mono;
 
 import java.time.Duration;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 @Slf4j
 @RestController
@@ -51,6 +51,10 @@ public class ChatController {
                 .register(meterRegistry);
     }
 
+    /**
+     * 普通聊天请求 - 统一走消息队列异步处理
+     * 包含完整的缓存、降级保护和流量削峰
+     */
     @PostMapping("/chat")
     public Mono<Map<String, Object>> chat(
             @RequestParam(required = false, defaultValue = "default-session") String memoryId,
@@ -64,6 +68,7 @@ public class ChatController {
 
         log.info("👤 [Session: {}] 收到用户提问：{}", memoryId, message);
 
+        // 紧急降级：直接返回兜底消息
         if (degradationService.isEmergency()) {
             log.warn("⚠️ 系统处于紧急降级模式");
             return Mono.just(Map.of(
@@ -73,66 +78,23 @@ public class ChatController {
             ));
         }
 
-        ragQueryCounter.increment();
-
-        return Mono.fromCallable(() -> {
-            if (degradationService.isCacheAvailable()) {
-                String cachedAnswer = ragCacheService.get(message);
-                if (cachedAnswer != null) {
-                    log.info("🎯 [Session: {}] 缓存命中", memoryId);
-                    return Map.<String, Object>of(
-                            "answer", cachedAnswer,
-                            "memoryId", memoryId,
-                            "cached", true
-                    );
-                }
-            }
-
-            try {
-                long startTime = System.currentTimeMillis();
-
-                MemoryIdContext.set(memoryId);
-                String answer = windFarmAssistant.chat(memoryId, message);
-
-                long duration = System.currentTimeMillis() - startTime;
-                log.info("🤖 [Session: {}] 回答耗时：{} ms", memoryId, duration);
-
-                degradationService.recordSuccess("llm");
-
-                if (degradationService.isCacheAvailable()) {
-                    String finalAnswer = answer;
-                    CompletableFuture.runAsync(() -> ragCacheService.put(message, finalAnswer));
-                }
-
-                return Map.<String, Object>of(
-                        "answer", answer,
+        // 先查缓存，缓存命中直接返回
+        if (degradationService.isCacheAvailable()) {
+            String cachedAnswer = ragCacheService.get(message);
+            if (cachedAnswer != null) {
+                log.info("🎯 [Session: {}] 缓存命中", memoryId);
+                ragQueryCounter.increment();
+                return Mono.just(Map.<String, Object>of(
+                        "answer", cachedAnswer,
                         "memoryId", memoryId,
-                        "durationMs", duration
-                );
-
-            } catch (Exception e) {
-                log.error("❌ [Session: {}] 处理请求时发生异常", memoryId, e);
-                degradationService.recordError("llm");
-                return Map.<String, Object>of("answer", "系统繁忙，请稍后再试。错误信息：" + e.getMessage());
+                        "cached", true
+                ));
             }
-        }).doOnNext(result -> ragQueryTimer.record(() -> {}));
-    }
-
-    @PostMapping("/chat/queue")
-    public Mono<Map<String, Object>> chatViaQueue(
-            @RequestParam(required = false, defaultValue = "default-session") String memoryId,
-            @RequestBody Map<String, String> payload
-    ) {
-        String message = payload.get("message");
-
-        if (message == null || message.trim().isEmpty()) {
-            return Mono.just(Map.of("answer", "问题不能为空"));
         }
 
-        log.info("📤 [消息队列模式] Session: {} 收到用户提问：{}", memoryId, message);
-
         ragQueryCounter.increment();
 
+        // 普通请求走消息队列异步处理，实现削峰填谷和流量控制
         return Mono.fromFuture(() -> chatMessageProducer.sendChatRequest(memoryId, message))
                 .timeout(Duration.ofSeconds(65))
                 .map(response -> {
@@ -170,6 +132,10 @@ public class ChatController {
                 });
     }
 
+    /**
+     * 流式聊天输出 - 直接响应，不走消息队列
+     * 保持流式体验，依然包含降级和缓存保护
+     */
     @PostMapping(value = "/chat/stream", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> chatStream(
             @RequestParam(required = false, defaultValue = "default-session") String memoryId,
@@ -183,6 +149,7 @@ public class ChatController {
 
         log.info("👤 [Session: {}] 收到流式提问：{}", memoryId, message);
 
+        // 紧急降级：直接返回兜底消息
         if (degradationService.isEmergency()) {
             log.warn("⚠️ 系统处于紧急降级模式");
             return Flux.just(
@@ -192,6 +159,7 @@ public class ChatController {
 
         ragQueryCounter.increment();
 
+        // 先查缓存，缓存命中直接流式返回
         if (degradationService.isCacheAvailable()) {
             String cachedAnswer = ragCacheService.get(message);
             if (cachedAnswer != null) {
@@ -205,6 +173,7 @@ public class ChatController {
 
         MemoryIdContext.set(memoryId);
 
+        // 直接流式输出
         return windFarmAssistant.chatStream(memoryId, message)
                 .map(chunk -> "data: {\"content\": \"" + escapeJson(chunk) + "\"}\n\n")
                 .concatWith(Flux.just("data: {\"done\": true}\n\n"))
@@ -216,60 +185,6 @@ public class ChatController {
                     log.error("❌ [Session: {}] 流式响应出错", memoryId, e);
                     degradationService.recordError("llm");
                 });
-    }
-
-    @PostMapping("/chat/safe")
-    public Mono<Map<String, Object>> chatWithProtection(
-            @RequestParam(required = false, defaultValue = "default-session") String memoryId,
-            @RequestBody Map<String, String> payload
-    ) {
-        String message = payload.get("message");
-
-        if (message == null || message.trim().isEmpty()) {
-            return Mono.just(Map.of("answer", "问题不能为空"));
-        }
-
-        log.info("👤 [Session: {}] 收到用户提问（带防护）：{}", memoryId, message);
-
-        if (degradationService.isEmergency()) {
-            return Mono.just(Map.of(
-                    "answer", degradationService.getFallbackMessage(),
-                    "degraded", true
-            ));
-        }
-
-        ragQueryCounter.increment();
-
-        return Mono.fromCallable(() -> {
-            try {
-                MemoryIdContext.set(memoryId);
-
-                String answer;
-                if (degradationService.isCacheAvailable()) {
-                    answer = ragCacheService.getWithBreakdownProtection(message, () -> {
-                        long startTime = System.currentTimeMillis();
-                        String result = windFarmAssistant.chat(memoryId, message);
-                        long duration = System.currentTimeMillis() - startTime;
-                        log.info("🤖 [Session: {}] RAG 查询耗时：{} ms", memoryId, duration);
-                        return result;
-                    });
-                } else {
-                    answer = windFarmAssistant.chat(memoryId, message);
-                }
-
-                degradationService.recordSuccess("llm");
-
-                return Map.<String, Object>of(
-                        "answer", answer,
-                        "memoryId", memoryId
-                );
-
-            } catch (Exception e) {
-                log.error("❌ [Session: {}] 处理请求时发生异常", memoryId, e);
-                degradationService.recordError("llm");
-                return Map.<String, Object>of("answer", "系统繁忙，请稍后再试。错误信息：" + e.getMessage());
-            }
-        });
     }
 
     @GetMapping("/chat")

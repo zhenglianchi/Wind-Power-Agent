@@ -8,8 +8,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.connection.RedisConnection;
-import org.springframework.data.redis.core.DefaultRedisScript;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 
 import jakarta.annotation.PostConstruct;
@@ -136,8 +136,7 @@ public class SemanticCacheService {
             // ON HASH - 索引 HASH 类型
             // PREFIX 1 ... - 只索引前缀匹配的 key
             // SCHEMA embedding VECTOR HNSW DIM 1536 DISTANCE_METRIC COSINE
-            Object result = connection.execute(
-                    "FT.CREATE".getBytes(),
+            Object result = connection.execute("FT.CREATE",
                     indexName.getBytes(),
                     "ON".getBytes(),
                     "HASH".getBytes(),

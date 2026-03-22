@@ -4,6 +4,7 @@ import com.itheima.consultant.dto.TurbineQueryDTO;
 import com.itheima.consultant.pojo.MemoryIdContext;
 import com.itheima.consultant.pojo.TurbineMonitorData;
 import com.itheima.consultant.repository.RedisChatMemoryProvider;
+import com.itheima.consultant.service.DegradationService;
 import com.itheima.consultant.service.EnhancedRAGService;
 import com.itheima.consultant.service.TurbineMonitorDataService;
 import dev.langchain4j.agent.tool.Tool;
@@ -30,6 +31,9 @@ public class WindFarmDataTools {
     @Autowired
     private EnhancedRAGService enhancedRAGService;
 
+    @Autowired
+    private DegradationService degradationService;
+
     @org.springframework.beans.factory.annotation.Value("${rag.turbine.default-limit:50}")
     private int defaultLimit;
 
@@ -51,6 +55,12 @@ public class WindFarmDataTools {
             @P("用户的搜索查询语句，应包含关键词，如故障代码、部件名称、技术术语等") String query
     ) {
         log.info("🔍 [RAG Tool] 触发知识库检索，原始查询：{}", query);
+
+        // 降级检查：如果工具已禁用，直接返回降级提示
+        if (!degradationService.isToolAvailable()) {
+            log.warn("⚠️ [降级] 工具调用已禁用，无法执行知识库检索");
+            return "当前系统处于降级模式，知识库检索工具暂不可用。请稍后再试。";
+        }
 
         try {
             EnhancedRAGService.EnhancedRAGResult result = enhancedRAGService.retrieveWithDetails(query);
@@ -104,6 +114,12 @@ public class WindFarmDataTools {
     ) {
         log.info("📊 [Data Tool] 查询风机监测数据 - 风场:{}, 风机:{}, 状态:{}", wfCode, turbineCode, statusCode);
 
+        // 降级检查：如果工具已禁用，直接返回降级提示
+        if (!degradationService.isToolAvailable()) {
+            log.warn("⚠️ [降级] 工具调用已禁用，无法执行风机数据查询");
+            return "当前系统处于降级模式，数据查询工具暂不可用。请稍后再试。";
+        }
+
         try {
             TurbineQueryDTO dto = new TurbineQueryDTO()
                     .setWfName(wfName)
@@ -153,6 +169,12 @@ public class WindFarmDataTools {
     ) {
         log.info("🔧 [Fault Tool] 查询故障记录 - 状态码:{}, 风场:{}", statusCode, wfCode);
 
+        // 降级检查：如果工具已禁用，直接返回降级提示
+        if (!degradationService.isToolAvailable()) {
+            log.warn("⚠️ [降级] 工具调用已禁用，无法执行故障记录查询");
+            return "当前系统处于降级模式，故障查询工具暂不可用。请稍后再试。";
+        }
+
         try {
             if (statusCode == null || statusCode.trim().isEmpty()) {
                 return "错误：必须提供状态代码（故障代码）。";
@@ -195,6 +217,12 @@ public class WindFarmDataTools {
     @Tool("获取当前用户的聊天历史记录。当用户询问之前的对话内容、要求回顾历史、或需要参考之前的故障排查步骤时使用。")
     public String getChatHistory() {
         String userId = MemoryIdContext.get();
+
+        // 降级检查：如果工具已禁用，直接返回降级提示
+        if (!degradationService.isToolAvailable()) {
+            log.warn("⚠️ [降级] 工具调用已禁用，无法获取聊天历史");
+            return "当前系统处于降级模式，历史查询工具暂不可用。请稍后再试。";
+        }
 
         if (userId == null) {
             return "错误：无法获取当前用户身份。";

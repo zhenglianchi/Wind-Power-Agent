@@ -1,6 +1,7 @@
 package com.itheima.consultant.service;
 
 import com.itheima.consultant.retriever.HybridRerankRetriever;
+import com.itheima.consultant.service.DegradationService;
 import dev.langchain4j.rag.content.Content;
 import dev.langchain4j.rag.query.Query;
 import lombok.extern.slf4j.Slf4j;
@@ -35,6 +36,10 @@ public class EnhancedRAGService {
     @Autowired
     private HybridRerankRetriever hybridRerankRetriever;
 
+    // 降级服务
+    @Autowired
+    private DegradationService degradationService;
+
     // 是否启用增强RAG
     @Value("${rag.enhanced.enabled:true}")
     private boolean enabled;
@@ -58,6 +63,12 @@ public class EnhancedRAGService {
      */
     public List<Content> retrieve(String originalQuery) {
         log.info("🚀 [增强RAG] 开始检索，原始查询: {}", originalQuery);
+
+        // 降级检查：如果RAG已禁用，直接返回空结果
+        if (!degradationService.isRagAvailable()) {
+            log.warn("⚠️ [降级] RAG服务已禁用，跳过检索");
+            return Collections.emptyList();
+        }
 
         if (!enabled) {
             return hybridRerankRetriever.retrieve(new Query(originalQuery));

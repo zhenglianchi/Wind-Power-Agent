@@ -57,29 +57,29 @@ public class ChatMessageConsumer {
                 return;
             }
 
-            if (degradationService.isCacheAvailable()) {
-                String cachedAnswer = ragCacheService.get(message.getMessage());
-                if (cachedAnswer != null) {
-                    log.info("🎯 [消息队列] 缓存命中: messageId={}", message.getMessageId());
-                    sendResponse(buildCachedResponse(message, cachedAnswer));
-                    return;
-                }
-            }
-
             MemoryIdContext.set(message.getMemoryId());
 
-            String answer = windFarmAssistant.chat(message.getMemoryId(), message.getMessage());
+            String answer;
+            if (degradationService.isCacheAvailable()) {
+                // 使用带击穿防护的缓存获取
+                answer = ragCacheService.getWithBreakdownProtection(message.getMessage(), () -> {
+                    long queryStart = System.currentTimeMillis();
+                    String result = windFarmAssistant.chat(message.getMemoryId(), message.getMessage());
+                    long queryDuration = System.currentTimeMillis() - queryStart;
+                    log.info("🤖 [消息队列] RAG 查询耗时：{} ms", queryDuration);
+                    return result;
+                });
+            } else {
+                // 缓存禁用，直接调用
+                answer = windFarmAssistant.chat(message.getMemoryId(), message.getMessage());
+            }
 
             long duration = System.currentTimeMillis() - startTime;
-            log.info("🤖 [消息队列] 处理完成: messageId={}, 耗时={}ms",
+            log.info("🤖 [消息队列] 处理完成: messageId={}, 总耗时={}ms",
                     message.getMessageId(), duration);
 
             degradationService.recordSuccess("llm");
-
-            if (degradationService.isCacheAvailable()) {
-                String finalAnswer = answer;
-                CompletableFuture.runAsync(() -> ragCacheService.put(message.getMessage(), finalAnswer));
-            }
+            // 写入缓存由 getWithBreakdownProtection 内部完成
 
             ChatResponse response = ChatResponse.builder()
                     .messageId(message.getMessageId())

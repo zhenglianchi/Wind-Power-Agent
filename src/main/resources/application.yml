@@ -134,6 +134,12 @@ rag:
     avalanche:
       enabled: true
       random-range-seconds: 300
+    semantic:
+      enabled: true
+      min-similarity: 0.85
+      max-candidates: 10
+      index-name: "rag_cache_semantic_idx"
+      vector-prefix: "rag:cache:vector:"
 
   degradation:
     level: NORMAL

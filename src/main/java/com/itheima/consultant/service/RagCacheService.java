@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.Counter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -26,6 +27,7 @@ public class RagCacheService {
 
     private final Cache<String, String> localCache;
     private final StringRedisTemplate redisTemplate;
+    private final SemanticCacheService semanticCacheService;
     private final Random random = new Random();
 
     // 配置参数
@@ -62,6 +64,7 @@ public class RagCacheService {
     // Micrometer 监控指标
     private final Counter l1HitCounter;
     private final Counter l2HitCounter;
+    private final Counter semanticHitCounter;
     private final Counter missCounter;
     private final Counter penetrationCounter;
     private final Counter breakdownCounter;
@@ -71,9 +74,11 @@ public class RagCacheService {
             @Value("${rag.cache.l1.max-size:50}") int l1MaxSize,
             @Value("${rag.cache.l1.expire-minutes:5}") int l1ExpireMinutes,
             StringRedisTemplate redisTemplate,
+            SemanticCacheService semanticCacheService,
             MeterRegistry meterRegistry) {
 
         this.redisTemplate = redisTemplate;
+        this.semanticCacheService = semanticCacheService;
 
         this.localCache = Caffeine.newBuilder()
                 .maximumSize(l1MaxSize)
@@ -90,6 +95,11 @@ public class RagCacheService {
         this.l2HitCounter = Counter.builder("rag.cache.hit")
                 .tag("level", "L2")
                 .description("L2 cache hit count")
+                .register(meterRegistry);
+
+        this.semanticHitCounter = Counter.builder("rag.cache.hit")
+                .tag("level", "SEMANTIC")
+                .description("Semantic cache hit count")
                 .register(meterRegistry);
 
         this.missCounter = Counter.builder("rag.cache.miss")
@@ -112,6 +122,9 @@ public class RagCacheService {
                 l1MaxSize, l1ExpireMinutes, redisExpireMinutes);
         log.info("🛡️ [RagCacheService] 缓存防护已启用 - 穿透防护: {}, 击穿防护: {}, 雪崩防护: {}",
                 penetrationEnabled, breakdownEnabled, avalancheEnabled);
+        if (semanticCacheService.isEnabled()) {
+            log.info("🧠 [RagCacheService] 语义缓存已启用，相似问题将可命中缓存");
+        }
     }
 
     /**
@@ -131,7 +144,7 @@ public class RagCacheService {
 
         String cacheKey = generateKey(question);
 
-        // 1. 尝试从 L1 Caffeine 获取
+        // 1. 尝试从 L1 Caffeine 获取（精确匹配）
         String cached = localCache.getIfPresent(cacheKey);
         if (cached != null) {
             if (isNullCache(cached)) {
@@ -143,7 +156,7 @@ public class RagCacheService {
             return cached;
         }
 
-        // 2. 尝试从 L2 Redis 获取
+        // 2. 尝试从 L2 Redis 获取（精确匹配）
         String redisKey = redisKeyPrefix + cacheKey;
         cached = redisTemplate.opsForValue().get(redisKey);
         if (cached != null) {
@@ -156,6 +169,18 @@ public class RagCacheService {
             l2HitCounter.increment();
             localCache.put(cacheKey, cached);
             return cached;
+        }
+
+        // 3. 尝试语义缓存匹配（精确不命中时，查找相似问题）
+        if (semanticCacheService.isEnabled()) {
+            String semanticAnswer = semanticCacheService.findSimilarAnswer(question);
+            if (semanticAnswer != null && !isNullCache(semanticAnswer)) {
+                log.info("🧠 [语义缓存命中] 问题: {}", truncate(question));
+                semanticHitCounter.increment();
+                // 回填到 L1 本地缓存，加速下次访问
+                localCache.put(cacheKey, semanticAnswer);
+                return semanticAnswer;
+            }
         }
 
         log.debug("❌ [缓存未命中] 问题: {}", truncate(question));
@@ -226,7 +251,7 @@ public class RagCacheService {
     }
 
     /**
-     * 写入缓存（L1 + L2）
+     * 写入缓存（L1 + L2 + 语义索引）
      *
      * @param question 用户问题
      * @param answer   答案
@@ -255,6 +280,11 @@ public class RagCacheService {
         String redisKey = redisKeyPrefix + cacheKey;
         int expireSeconds = calculateExpireTime();
         redisTemplate.opsForValue().set(redisKey, answer, expireSeconds, TimeUnit.SECONDS);
+
+        // 添加到语义索引
+        if (semanticCacheService.isEnabled()) {
+            semanticCacheService.addToIndex(question, cacheKey);
+        }
 
         log.debug("📝 [缓存已写入] 问题: {}, 过期时间: {}秒", truncate(question), expireSeconds);
     }
@@ -304,6 +334,11 @@ public class RagCacheService {
         String redisKey = redisKeyPrefix + cacheKey;
         redisTemplate.delete(redisKey);
 
+        // 从语义索引移除
+        if (semanticCacheService.isEnabled()) {
+            semanticCacheService.removeFromIndex(cacheKey);
+        }
+
         log.debug("🗑️ [缓存已清除] 问题: {}", truncate(question));
     }
 
@@ -316,6 +351,11 @@ public class RagCacheService {
         var keys = redisTemplate.keys(redisKeyPrefix + "*");
         if (keys != null && !keys.isEmpty()) {
             redisTemplate.delete(keys);
+        }
+
+        // 清空语义索引
+        if (semanticCacheService.isEnabled()) {
+            semanticCacheService.clearAll();
         }
 
         log.info("🗑️ [所有缓存已清除]");

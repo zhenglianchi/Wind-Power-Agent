@@ -38,6 +38,7 @@ Wind-Power-Q-A/
 │   │   ├── KnowledgeRebuildProducer.java
 │   │   ├── QueryRewriteService.java
 │   │   ├── RagCacheService.java
+│   │   ├── SemanticCacheService.java
 │   │   └── TurbineMonitorDataService.java
 │   ├── retriever/           # 检索器
 │   │   └── HybridRerankRetriever.java
@@ -139,29 +140,77 @@ private DocumentSplitter createSplitter() {
 
 ### 3. 多级缓存系统
 
-#### 3.1 两级缓存架构
-- **L1 缓存**: Caffeine 本地缓存（毫秒级响应）
-- **L2 缓存**: Redis 分布式缓存（跨实例共享）
+#### 3.1 三级缓存架构
+- **L1 缓存**: Caffeine 本地缓存（毫秒级响应，精确匹配）
+- **L2 缓存**: Redis 分布式缓存（跨实例共享，精确匹配）
+- **L3 缓存**: 语义缓存（RediSearch Vector Search，相似问题匹配）
+
+**语义缓存工作原理**：当精确缓存不命中时，使用 KNN 向量搜索查找语义相似的已缓存问题，如果相似度超过阈值则直接返回缓存答案，大大提高缓存命中率。
 
 ```java
 // RagCacheService.java
 public String get(String question) {
-    // 1. 先查 L1 Caffeine
+    // 1. 先查 L1 Caffeine（精确匹配）
     String cached = localCache.getIfPresent(cacheKey);
     if (cached != null) return cached;
-    
-    // 2. 再查 L2 Redis
+
+    // 2. 再查 L2 Redis（精确匹配）
     cached = redisTemplate.opsForValue().get(redisKey);
     if (cached != null) {
         localCache.put(cacheKey, cached); // 回填 L1
         return cached;
     }
-    
+
+    // 3. 尝试语义缓存匹配（精确不命中时，查找相似问题）
+    if (semanticCacheService.isEnabled()) {
+        String semanticAnswer = semanticCacheService.findSimilarAnswer(question);
+        if (semanticAnswer != null) {
+            localCache.put(cacheKey, semanticAnswer); // 回填 L1
+            return semanticAnswer;
+        }
+    }
+
     return null;
 }
 ```
 
-#### 3.2 缓存防护机制
+#### 3.2 语义缓存核心特性
+
+基于 RediSearch Vector Search 实现，自动创建向量索引，支持相似问题命中缓存：
+
+| 特性 | 说明 |
+|-----|------|
+| **自动索引创建** | 启动时自动检查并创建索引，无需手动操作 |
+| **余弦相似度** | 使用余弦相似度计算问题语义相似度 |
+| **可配置阈值** | 通过 `min-similarity` 控制匹配严格度 |
+| **存储结构** | 每个问题存储为 Redis HASH，包含向量、原始问题、缓存 key |
+| **一致性维护** | 清除缓存时同步清理语义索引 |
+
+```java
+// SemanticCacheService.java
+public String findSimilarAnswer(String question) {
+    // 1. 计算问题嵌入向量
+    Embedding embedding = embeddingModel.embed(question).content();
+    float[] vector = embedding.vector();
+
+    // 2. KNN 搜索最相似的 Top-N 问题
+    List<SearchResult> results = searchKnn(vector);
+
+    // 3. 遍历结果找到第一个超过相似度阈值的
+    for (SearchResult result : results) {
+        // RediSearch 返回余弦距离 (0~2)，转换为相似度: similarity = 1 - distance/2
+        double similarity = 1.0 - (result.distance / 2.0);
+        if (similarity >= minSimilarity) {
+            // 返回对应缓存答案
+            String cachedAnswer = redisTemplate.opsForValue().get(cacheKey);
+            return cachedAnswer;
+        }
+    }
+    return null;
+}
+```
+
+#### 3.3 缓存防护机制
 
 | 防护类型 | 问题描述 | 解决方案 |
 |---------|---------|---------|
@@ -464,6 +513,12 @@ rag:
       expire-minutes: 5
     l2:
       expire-minutes: 60
+    semantic:
+      enabled: true         # 是否启用语义缓存
+      min-similarity: 0.85 # 最小相似度阈值（越高越严格）
+      max-candidates: 10    # KNN搜索返回候选数
+      index-name: "rag_cache_semantic_idx"
+      vector-prefix: "rag:cache:vector:"
   degradation:
     level: NORMAL
 
@@ -486,256 +541,7 @@ rabbitmq:
 | 重排序模型 | GTE-Rerank-v2 |
 | 向量数据库 | Redis (RediSearch) |
 | 消息队列 | RabbitMQ |
-| 缓存 | Caffeine + Redis |
+| 缓存 | Caffeine + Redis + RediSearch 语义缓存 |
 | 数据库 | MySQL + MyBatis-Plus |
 | 监控 | Micrometer + Prometheus |
 
----
-
-## 高频面试题及解答
-
-### 1. RAG 检索增强生成
-
-**Q: 什么是 RAG？为什么需要 RAG？**
-
-A: RAG（Retrieval-Augmented Generation）是一种将检索与生成相结合的技术。它通过检索外部知识库中的相关文档，将其作为上下文提供给 LLM，从而增强模型的回答能力。
-
-**为什么需要 RAG：**
-- **知识时效性**：LLM 训练数据有截止日期，无法获取最新知识
-- **领域专业性**：企业私有知识（如风电运维手册）不在 LLM 训练数据中
-- **减少幻觉**：基于检索到的真实文档回答，降低模型编造内容的风险
-- **可解释性**：可以追溯答案来源，提供引用依据
-
-**Q: 为什么使用混合检索而不是单一检索？**
-
-A: 
-- **向量检索**擅长语义理解，能找到意思相近但词汇不同的内容
-- **关键词检索**擅长精确匹配，对专有名词、故障代码等效果更好
-- **两者结合**可以互补，提高召回率和准确率
-- 使用 RRF（Reciprocal Rank Fusion）算法合并结果，平衡两种检索的优势
-
-**Q: HyDE 是什么？如何提升检索效果？**
-
-A: HyDE（Hypothetical Document Embeddings）的核心思想是：让 LLM 先生成一个"假设性答案"，然后用这个假设答案去检索。
-
-**原理**：
-1. 用户提问："E-204故障怎么处理？"
-2. LLM 生成假设文档："E-204故障通常由变桨系统异常引起，处理步骤包括..."
-3. 用假设文档的向量去检索，更容易匹配到真实的技术文档
-
-**优势**：假设文档包含了更多相关术语和上下文，检索效果往往优于直接用问题检索。
-
----
-
-### 2. 缓存系统
-
-**Q: 为什么要用多级缓存？Caffeine 和 Redis 各有什么特点？**
-
-A:
-
-| 特性 | Caffeine (L1) | Redis (L2) |
-|-----|---------------|------------|
-| **位置** | 应用内存 | 独立服务 |
-| **速度** | 纳秒级 | 毫秒级 |
-| **容量** | 受限于 JVM 堆内存 | 受限于服务器内存 |
-| **共享** | 单实例 | 多实例共享 |
-| **持久化** | 否 | 是 |
-
-**多级缓存的优势**：
-1. 热点数据在本地内存，响应极快
-2. 非热点数据在 Redis，多实例共享
-3. Redis 故障时，本地缓存仍可提供有限服务
-
-**Q: 什么是缓存穿透、缓存击穿、缓存雪崩？如何解决？**
-
-A:
-
-| 问题 | 描述 | 解决方案 |
-|-----|------|---------|
-| **缓存穿透** | 恶意查询不存在的数据，绕过缓存直接打到数据库 | 1. 空值缓存（短TTL）<br>2. 布隆过滤器 |
-| **缓存击穿** | 热点 Key 过期瞬间，大量请求同时穿透到数据库 | 1. 分布式锁互斥更新<br>2. 永不过期 + 异步更新 |
-| **缓存雪崩** | 大量缓存同时过期，数据库压力骤增 | 1. 随机过期时间<br>2. 多级缓存<br>3. 熔断降级 |
-
-**代码示例**：
-```java
-// 缓存穿透防护 - 空值缓存
-if (answer == null) {
-    redisTemplate.opsForValue().set(key, "NULL", 60, TimeUnit.SECONDS);
-}
-
-// 缓存击穿防护 - 分布式锁
-Boolean locked = redisTemplate.opsForValue().setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS);
-if (locked) {
-    answer = loadFromDB();
-    cache.put(key, answer);
-}
-
-// 缓存雪崩防护 - 随机过期
-int expire = baseExpire + random.nextInt(300);
-```
-
----
-
-### 3. 消息队列
-
-**Q: 为什么使用 RabbitMQ 处理聊天请求？**
-
-A:
-1. **削峰填谷**：高并发时请求先入队，消费者按能力处理，避免系统崩溃
-2. **解耦**：生产者和消费者独立运行，便于维护和扩展
-3. **异步处理**：用户无需等待，提升体验
-4. **可靠性**：消息持久化、确认机制、死信队列保证消息不丢失
-
-**Q: 如何实现限流？参数如何配置？**
-
-A: 通过消费者并发数和预取数量控制：
-
-```yaml
-rabbitmq:
-  chat:
-    concurrency: 5          # 最小消费者数
-    max-concurrency: 20     # 最大消费者数
-    prefetch: 2             # 每个消费者预取消息数
-```
-
-**最大并发处理数 = max-concurrency × prefetch = 40**
-
-**Q: 死信队列是什么？如何使用？**
-
-A: 死信队列（Dead Letter Queue）用于存储处理失败的消息。
-
-**触发条件**：
-1. 消息被拒绝且不重新入队
-2. 消息过期
-3. 队列满了
-
-**本项目使用场景**：
-- 消息处理失败自动进入 DLQ
-- 监听 DLQ 进行重试（最多 3 次）
-- 超过重试次数后记录日志并丢弃
-
-```java
-@RabbitListener(queues = CHAT_DLQ)
-public void handleDeadLetter(ChatMessage message) {
-    if (message.getRetryCount() < 3) {
-        message.setRetryCount(message.getRetryCount() + 1);
-        rabbitTemplate.convertAndSend(CHAT_EXCHANGE, CHAT_ROUTING_KEY, message);
-    }
-}
-```
-
----
-
-### 4. 高并发处理
-
-**Q: 高并发场景下如何保证系统稳定性？**
-
-A:
-
-1. **限流**：RabbitMQ 消费者并发控制 + 队列最大长度
-2. **缓存**：多级缓存减少数据库压力
-3. **降级**：分级降级保护核心功能
-4. **熔断**：连续错误触发降级
-5. **异步**：消息队列解耦
-6. **监控**：Micrometer 指标实时监控
-
-**Q: 如何实现服务降级？**
-
-A: 采用分级降级策略：
-
-```
-NORMAL → DISABLE_CACHE → DISABLE_RAG → DISABLE_TOOL → EMERGENCY
-```
-
-**触发条件**：
-- 连续错误达到阈值（5次/分钟）
-- 手动触发
-
-**降级效果**：
-- DISABLE_CACHE：跳过缓存，直接查询
-- DISABLE_RAG：不检索知识库，直接回答
-- EMERGENCY：返回预设消息，保护系统
-
----
-
-### 5. 向量检索
-
-**Q: 向量检索的原理是什么？**
-
-A:
-1. **Embedding**：将文本转换为高维向量（如 1536 维）
-2. **存储**：将向量存入向量数据库（Redis）
-3. **检索**：将查询文本转换为向量，计算与存储向量的相似度
-4. **排序**：返回相似度最高的 Top-K 结果
-
-**相似度计算**：通常使用余弦相似度或点积
-
-**Q: 为什么需要 Rerank？**
-
-A:
-- 向量检索基于语义相似度，可能遗漏精确匹配
-- Rerank 模型专门训练用于判断文档与查询的相关性
-- Rerank 后的结果更准确，相关性更高
-
-**流程**：向量召回 Top-20 → Rerank 重排序 → 返回 Top-5
-
----
-
-### 6. 系统设计
-
-**Q: 如果 Redis 挂了怎么办？**
-
-A:
-1. **本地缓存兜底**：Caffeine 仍可提供有限服务
-2. **降级机制**：自动切换到 DISABLE_CACHE 模式
-3. **熔断保护**：连续错误触发 EMERGENCY 模式
-4. **监控告警**：Micrometer 指标 + Prometheus 告警
-
-**Q: 如何保证消息不丢失？**
-
-A:
-1. **生产者确认**：RabbitMQ Publisher Confirm
-2. **消息持久化**：队列和消息都设置为持久化
-3. **消费者确认**：手动 ACK 或自动 ACK
-4. **死信队列**：处理失败的消息进入 DLQ 重试
-
-**Q: 如何扩展到分布式部署？**
-
-A:
-1. **无状态服务**：ChatController 无状态，可水平扩展
-2. **共享存储**：Redis 作为共享缓存和向量存储
-3. **消息队列**：RabbitMQ 多消费者实例
-4. **负载均衡**：Nginx 或 Spring Cloud Gateway
-5. **会话管理**：memoryId 关联 Redis 存储
-
----
-
-### 7. 性能优化
-
-**Q: 如何优化 RAG 检索性能？**
-
-A:
-1. **预计算向量**：文档入库时预计算并存储向量
-2. **索引优化**：RediSearch 建立索引加速关键词检索
-3. **批量处理**：批量 Embedding 减少网络开销
-4. **缓存热查询**：热点问题缓存答案
-5. **异步处理**：HyDE 和查询改写可异步执行
-
-**Q: 如何监控和排查问题？**
-
-A:
-1. **日志**：详细日志记录每个步骤耗时
-2. **指标**：Micrometer 暴露缓存命中率、检索耗时等
-3. **链路追踪**：每个请求有唯一 messageId
-4. **健康检查**：Actuator 端点监控服务状态
-
-```bash
-# 查看缓存统计
-GET /api/cache/stats
-
-# 查看降级状态
-GET /api/degradation/status
-
-# Prometheus 指标
-GET /actuator/prometheus
-```

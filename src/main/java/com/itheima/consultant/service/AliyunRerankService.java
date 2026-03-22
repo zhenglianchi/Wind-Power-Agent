@@ -14,18 +14,33 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+/**
+ * 阿里云GTE重排序服务
+ * 调用阿里云大模型服务平台的Rerank API，对召回的候选文档进行语义相关性重排序
+ * 提高检索准确性，将最相关的文档排在前面
+ */
 @Slf4j
 @Service
 public class AliyunRerankService {
 
+    // WebClient用于调用HTTP API
     private final WebClient webClient;
+    // 模型名称
     private final String modelName;
+    // API路径
     private final String apiPath;
+    // JSON解析器
     private final ObjectMapper objectMapper = new ObjectMapper();
 
+    /**
+     * 重排序结果实体类
+     */
     public static class RerankResult {
+        // 文档文本
         public String text;
+        // 相关性分数（0-1，越高越相关）
         public double score;
+        // 在原列表中的索引
         public int index;
 
         public RerankResult(String text, double score, int index) {
@@ -40,6 +55,9 @@ public class AliyunRerankService {
         }
     }
 
+    /**
+     * 构造函数，通过依赖注入初始化配置并创建WebClient
+     */
     public AliyunRerankService(
             @Value("${langchain4j.open-ai.rerank-model.base-url}") String baseUrl,
             @Value("${langchain4j.open-ai.rerank-model.api-key}") String apiKey,
@@ -57,7 +75,10 @@ public class AliyunRerankService {
     }
 
     /**
-     * 调用阿里云 Rerank API
+     * 调用阿里云Rerank API对文档进行重排序
+     * @param query 用户查询
+     * @param documents 待排序的候选文档列表
+     * @return 按相关性分数降序排列的重排序结果，如果API调用失败返回降级结果（原顺序，分数为0）
      */
     public List<RerankResult> rerank(String query, List<String> documents) {
         if (documents == null || documents.isEmpty()) {
@@ -119,6 +140,13 @@ public class AliyunRerankService {
         }
     }
 
+    /**
+     * 解析阿里云Rerank API返回的JSON响应
+     * @param json API返回的JSON字符串
+     * @param originalDocs 原始文档列表，用于在API未返回文本时兜底
+     * @return 解析后的重排序结果列表，按分数降序排列
+     * @throws Exception JSON解析异常
+     */
     private List<RerankResult> parseResponse(String json, List<String> originalDocs) throws Exception {
         JsonNode root = objectMapper.readTree(json);
 

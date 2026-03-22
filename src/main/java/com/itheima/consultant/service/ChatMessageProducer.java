@@ -14,15 +14,28 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
+/**
+ * 聊天消息生产者
+ * 将聊天请求发送到RabbitMQ异步处理，然后等待响应返回
+ * 实现了异步请求-响应模式，解耦发送和接收
+ */
 @Slf4j
 @Service
 public class ChatMessageProducer {
 
+    // RabbitMQ模板
     @Autowired
     private RabbitTemplate rabbitTemplate;
 
+    // 保存待处理的请求，消息ID -> CompletableFuture，当响应返回时完成
     private final Map<String, CompletableFuture<ChatResponse>> pendingRequests = new ConcurrentHashMap<>();
 
+    /**
+     * 发送聊天请求到消息队列，返回CompletableFuture异步等待结果
+     * @param memoryId 对话记忆ID，区分不同会话
+     * @param message 用户提问内容
+     * @return 可异步等待聊天响应的CompletableFuture
+     */
     public CompletableFuture<ChatResponse> sendChatRequest(String memoryId, String message) {
         ChatMessage chatMessage = ChatMessage.create(memoryId, message);
 
@@ -60,6 +73,11 @@ public class ChatMessageProducer {
         return future;
     }
 
+    /**
+     * 监听响应队列，接收AI处理完成后的响应
+     * 根据messageId找到对应的CompletableFuture并完成它
+     * @param response 聊天响应
+     */
     @RabbitListener(queues = RabbitMQConfig.RESPONSE_QUEUE)
     public void handleResponse(ChatResponse response) {
         CompletableFuture<ChatResponse> future = pendingRequests.remove(response.getMessageId());

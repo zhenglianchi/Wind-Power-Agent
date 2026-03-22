@@ -11,31 +11,51 @@ import org.springframework.stereotype.Service;
 import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * 增强RAG服务
+ * 通过查询改写(Query Rewrite)和假设文档生成(HyDE)技术提升检索效果
+ *
+ * Query Rewrite：将原始问题扩展为多个相关查询，提高召回率
+ * HyDE (Hypothetical Document Embeddings)：先生成一个假设的回答文档，
+ *      然后用这个文档去检索，能更好地匹配语义相似的真实文档
+ */
 @Slf4j
 @Service
 public class EnhancedRAGService {
 
+    // 查询改写服务
     @Autowired
     private QueryRewriteService queryRewriteService;
 
+    // HyDE假设文档生成服务
     @Autowired
     private HyDEService hydeService;
 
+    // 混合检索重排序器
     @Autowired
     private HybridRerankRetriever hybridRerankRetriever;
 
+    // 是否启用增强RAG
     @Value("${rag.enhanced.enabled:true}")
     private boolean enabled;
 
+    // 是否启用查询改写
     @Value("${rag.enhanced.use-query-rewrite:true}")
     private boolean useQueryRewrite;
 
+    // 是否启用HyDE
     @Value("${rag.enhanced.use-hyde:true}")
     private boolean useHyde;
 
+    // 多查询结果合并策略：UNION(并集)/INTERSECTION(交集)/FIRST_ONLY(仅第一个)
     @Value("${rag.enhanced.merge-strategy:UNION}")
     private String mergeStrategy;
 
+    /**
+     * 增强RAG检索入口
+     * @param originalQuery 原始用户查询
+     * @return 检索到的相关内容列表
+     */
     public List<Content> retrieve(String originalQuery) {
         log.info("🚀 [增强RAG] 开始检索，原始查询: {}", originalQuery);
 
@@ -112,6 +132,11 @@ public class EnhancedRAGService {
         return allContents;
     }
 
+    /**
+     * 增强RAG检索，返回详细信息（包括改写查询、HyDE文档等）用于调试和监控
+     * @param originalQuery 原始用户查询
+     * @return 包含检索过程详细信息的结果对象
+     */
     public EnhancedRAGResult retrieveWithDetails(String originalQuery) {
         long startTime = System.currentTimeMillis();
 

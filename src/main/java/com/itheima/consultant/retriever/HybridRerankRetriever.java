@@ -23,78 +23,96 @@ import java.util.regex.Pattern;
 import java.util.*;
 import java.util.stream.Collectors;
 
+/**
+ * 混合检索重排序器 - RAG检索核心组件
+ * 实现了【向量检索 + 关键词检索】的混合召回，并使用RRF算法融合结果，最后通过阿里云GTE-Rerank进行重排序
+ * 这种混合检索策略结合了向量检索的语义匹配能力和关键词检索的精确匹配能力，提高检索准确性
+ */
 @Slf4j
 @Component
 public class HybridRerankRetriever implements ContentRetriever {
-    // 👇 新增：配置开关
+    // 是否注入长期记忆配置开关
     @Value("${rag.memory.inject-long-term:true}")
     private boolean injectLongTermMemory;
 
+    // 向量存储（存储所有文档片段的embedding）
     @Autowired
     private EmbeddingStore<TextSegment> embeddingStore;
 
+    // 向量化模型（将查询文本转换为向量）
     @Autowired
     private EmbeddingModel embeddingModel;
 
+    // 阿里云重排序服务（对候选文档进行语义相关性重排序）
     @Autowired
     private AliyunRerankService rerankService;
 
+    // Redis模板（用于执行RediSearch关键词检索）
     @Autowired
     private StringRedisTemplate redisTemplate;
 
-    // 复用原有配置
+    // 向量检索召回的最大候选数
     @Value("${rag.retrieval.top-k-recall:30}")
     private int topKRecall;
 
+    // 最终返回给LLM的最大上下文数量
     @Value("${rag.retrieval.top-k-final:5}")
     private int topKFinal;
 
+    // 向量检索的最小相似度分数阈值，低于该分数的文档将被过滤
     @Value("${rag.retrieval.min-score:0.4}")
     private double minScore;
 
+    // 重排序分数阈值，低于该分数的文档将被过滤
     @Value("${rag.retrieval.rerank-threshold:0.5}")
     private double rerankThreshold;
 
-    // 新增关键词检索配置
+    // 关键词检索召回的最大候选数
     @Value("${rag.retrieval.keyword-top-k:20}")
     private int keywordTopK;
 
-    // RRF配置
+    // RRF(Reciprocal Rank Fusion)算法的k参数，用于平衡不同检索结果的排名
     @Value("${rag.retrieval.rrf-k:60}")
     private int rrfK;
 
-    // RediSearch索引名称
+    // RediSearch在Redis中创建的索引名称
     @Value("${rag.redis.index-name:embedding-index}")
     private String searchIndex;
 
-    // 新增配置：是否启用模糊匹配兜底
+    // 是否启用模糊匹配兜底策略，当分词检索结果过少时自动触发
     @Value("${rag.retrieval.keyword.fuzzy-enabled:true}")
     private boolean fuzzyEnabled;
 
+    // 正则表达式：匹配英文/数字组合（用于保护故障代码如E-204不被分词拆分）
     private static final Pattern ALPHANUMERIC_PATTERN = Pattern.compile("[a-zA-Z0-9]+(?:[-_][a-zA-Z0-9]+)*");
 
 
+    /**
+     * 核心检索方法，被langchain4j RAG流程调用
+     * @param query 用户查询
+     * @return 检索到的相关内容列表
+     */
     @Override
     public List<Content> retrieve(Query query) {
         log.info("🚀 [混合检索] 开始处理查询：{}", query.text());
 
         List<Content> allContents = new ArrayList<>();
 
-        // --- 步骤 1: 原有的向量召回 + 关键词召回 ---
+        // 步骤1: 混合召回 - 同时进行向量检索和关键词检索，然后用RRF融合
         List<ScoredDocument> candidates = fetchCandidates(query);
 
         if (!candidates.isEmpty()) {
-            // 提取文本准备 Rerank
+            // 提取去重后的候选文档文本
             List<String> candidateTexts = candidates.stream()
                     .map(ScoredDocument::getText)
                     .distinct()
                     .collect(Collectors.toList());
 
-            // --- 步骤 2: 阿里云 Rerank ---
+            // 步骤2: 调用阿里云GTE-Rerank进行语义重排序
             log.info("🔄 [Rerank] 正在调用阿里云 GTE-Rerank...");
             List<AliyunRerankService.RerankResult> rerankedResults = rerankService.rerank(query.text(), candidateTexts);
 
-            // --- 步骤 3: 过滤与转换 ---
+            // 步骤3: 根据重排序分数过滤，只保留分数高于阈值的前topKFinal个文档
             List<Content> ragContents = rerankedResults.stream()
                     .filter(r -> r.score >= rerankThreshold)
                     .limit(topKFinal)
@@ -105,14 +123,14 @@ public class HybridRerankRetriever implements ContentRetriever {
             log.info("✅ [检索] RAG 部分召回 {} 条内容", ragContents.size());
         }
 
-        // --- 最终日志 ---
         log.info("📦 [检索完成] 最终返回上下文总数: {}", allContents.size());
-
         return allContents;
     }
 
     /**
-     * 获取所有候选文档（向量召回 + 关键词召回）
+     * 获取所有候选文档（向量召回 + 关键词召回，RRF融合）
+     * @param query 用户查询
+     * @return 融合排序后的候选文档列表
      */
     private List<ScoredDocument> fetchCandidates(Query query) {
         long fetchStart = System.currentTimeMillis();
@@ -169,7 +187,10 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 向量检索
+     * 向量检索（语义检索）
+     * 将查询文本转换为向量，然后在向量库中查找最相似的文档
+     * @param query 用户查询
+     * @return 排序后的候选文档列表
      */
     private List<ScoredDocument> vectorSearch(Query query) {
         EmbeddingSearchRequest request = EmbeddingSearchRequest.builder()
@@ -189,59 +210,67 @@ public class HybridRerankRetriever implements ContentRetriever {
 
     /**
      * RediSearch 关键词检索 - 优化版：支持分词 OR 查询 + 模糊兜底
+     * 使用Redis的RediSearch模块进行全文关键词检索
+     * 优化策略：
+     * 1. 中文分词后使用OR查询，提高召回率
+     * 2. 如果结果过少，自动启用模糊匹配兜底
+     * @param query 用户查询
+     * @return 检索到的文档列表
      */
     private List<ScoredDocument> keywordSearch(Query query) {
         long startTime = System.currentTimeMillis();
         String originalQuery = query.text();
 
         try {
-            // 1. 策略一：中文分词 + OR 组合 (提高召回率的核心)
-            // 将 "风电项目管理系统" 分词为 "风电", "项目", "管理", "系统"
-            // 构建查询语句： "风电 | 项目 | 管理 | 系统"
+            // 策略一：中文分词 + OR 组合 (提高召回率的核心)
+            // 例如：将 "风电项目管理系统" 分词为 ["风电", "项目", "管理", "系统"]
+            // 构建查询语句：(风电|项目|管理|系统)，只要包含任意一个关键词即可命中
             List<String> keywords = tokenizeQuery(originalQuery);
 
-            // 过滤掉停用词或过短的词 (可选优化)
+            // 过滤掉停用词和过短的词，减少噪音
             keywords = keywords.stream()
                     .filter(k -> k.length() > 1)
                     .collect(Collectors.toList());
 
             String searchQueryStr;
             if (!keywords.isEmpty()) {
-                // 用 OR (|) 连接，只要包含任意一个词即可命中
+                // 用 OR (|) 连接所有关键词，只要文档包含任意一个关键词即可命中
                 searchQueryStr = "(" + String.join("|", keywords.stream().map(this::escapeQuery).collect(Collectors.toList())) + ")";
                 log.info("🔍 [关键字检索] 分词策略 | 原始: {} | 分词后查询: {}", originalQuery, searchQueryStr);
             } else {
-                // 如果分词失败或为空，降级为原句
+                // 如果分词失败或结果为空，降级为使用原句查询
                 searchQueryStr = escapeQuery(originalQuery);
                 log.warn("⚠️ [关键字检索] 分词结果为空，降级为原句查询: {}", searchQueryStr);
             }
 
-            // 2. 执行检索
+            // 执行RediSearch检索
             List<ScoredDocument> results = executeRediSearch(searchQueryStr, keywordTopK);
 
-            // 3. 策略二：如果结果太少，启用模糊匹配兜底 (Wildcard)
-            // 如果分词查出来的结果少于 3 条，尝试用 *关键词* 这种暴力方式再查一次合并
+            // 策略二：结果过少兜底 - 如果分词检索结果少于3条，启用模糊匹配兜底
+            // 使用 *关键词* 方式进行模糊搜索，尽可能召回相关文档
             if (fuzzyEnabled && results.size() < 3 && keywords.size() > 0) {
                 log.info("🔍 [关键字检索] 结果过少 ({} 条), 触发模糊兜底策略...", results.size());
 
-                // 选取最长的 1-2 个核心词进行模糊搜索，避免 *太* 短的词导致全表扫描
+                // 选取最长的关键词作为核心词进行模糊搜索，避免过短词导致全表扫描
                 String coreKeyword = keywords.stream()
                         .sorted((a, b) -> Integer.compare(b.length(), a.length()))
                         .findFirst()
                         .orElse("");
 
                 if (StringUtils.isNotEmpty(coreKeyword)) {
+                    // 在关键词前后加通配符*，实现模糊匹配
                     String fuzzyQuery = "*" + escapeQuery(coreKeyword) + "*";
                     log.info("🔍 [关键字检索] 模糊兜底查询: {}", fuzzyQuery);
 
-                    List<ScoredDocument> fuzzyResults = executeRediSearch(fuzzyQuery, 10); // 兜底只查少量
+                    // 执行模糊搜索，只返回前10条避免结果过多
+                    List<ScoredDocument> fuzzyResults = executeRediSearch(fuzzyQuery, 10);
 
-                    // 合并结果 (去重)
+                    // 合并结果并去重，模糊搜索结果分数较低
                     Map<String, ScoredDocument> mergedMap = new LinkedHashMap<>();
                     results.forEach(d -> mergedMap.put(getDocId(d), d));
                     fuzzyResults.forEach(d -> {
                         if (!mergedMap.containsKey(getDocId(d))) {
-                            // 模糊搜索的分数通常较低，给一个基础分
+                            // 模糊搜索的精度较低，给一个较低的基础分
                             d.setScore(0.3);
                             mergedMap.put(getDocId(d), d);
                         }
@@ -255,14 +284,16 @@ public class HybridRerankRetriever implements ContentRetriever {
             return results;
 
         } catch (Exception e) {
-            // ... 原有异常处理保持不变
             log.error("❌ [关键字检索] 执行失败", e);
             throw new RuntimeException("RediSearch 关键字检索失败", e);
         }
     }
 
     /**
-     * 封装具体的 Redis 执行逻辑，方便复用
+     * 封装RediSearch执行逻辑，通过Lua脚本执行FT.SEARCH命令
+     * @param queryStr RediSearch查询字符串
+     * @param limit 返回最大结果数
+     * @return 解析后的文档列表
      */
     private List<ScoredDocument> executeRediSearch(String queryStr, int limit) {
         String luaScript = String.format(
@@ -281,7 +312,9 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 转义Lua字符串中的特殊字符，防止脚本注入
+     * 转义Lua字符串中的特殊字符，防止脚本注入和语法错误
+     * @param input 原始字符串
+     * @return 转义后的字符串
      */
     private String escapeLuaString(String input) {
         if (input == null) return "";
@@ -294,8 +327,10 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 解析RediSearch返回结果 - 修正版
+     * 解析RediSearch返回结果
      * RediSearch FT.SEARCH 返回格式: [总数, docId1, fields1, docId2, fields2, ...]
+     * @param results Redis返回的原始结果列表
+     * @return 解析后的ScoredDocument列表
      */
     @SuppressWarnings("unchecked")
     private List<ScoredDocument> parseRedisSearchResults(List<Object> results) {
@@ -383,7 +418,9 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 将字节数组或字符串转换为字符串
+     * 将字节数组或对象转换为字符串，处理RediSearch返回的多种类型
+     * @param obj Redis返回的对象（可能是byte[]或String）
+     * @return 转换后的字符串
      */
     private String bytesToString(Object obj) {
         if (obj == null) return "";
@@ -394,7 +431,12 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 使用 RRF 算法合并两个结果集
+     * 使用 RRF(Reciprocal Rank Fusion) 算法合并向量检索和关键词检索两个结果集
+     * RRF算法原理：对每个结果，根据其在不同排名中的位置计算分数 1/(k + rank)，然后累加
+     * 这种方法无需训练，能有效融合不同检索方法的优势
+     * @param vectorDocs 向量检索结果
+     * @param keywordDocs 关键词检索结果
+     * @return 合并排序后的结果
      */
     private List<ScoredDocument> mergeWithRRF(List<ScoredDocument> vectorDocs, List<ScoredDocument> keywordDocs) {
         if (keywordDocs.isEmpty()) {
@@ -483,7 +525,9 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 从向量匹配结果中提取文档ID
+     * 从向量匹配结果的元数据中提取文档ID
+     * @param match 向量匹配结果
+     * @return 文档ID，如果元数据中没有则生成一个基于文本哈希的ID
      */
     private String extractDocId(EmbeddingMatch<TextSegment> match) {
         if (match.embedded() != null &&
@@ -495,7 +539,9 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 获取文档ID
+     * 获取文档ID，如果为null则基于文本哈希生成
+     * @param doc 带分数的文档对象
+     * @return 文档ID
      */
     private String getDocId(ScoredDocument doc) {
         return doc.getId() != null ? doc.getId() :
@@ -503,7 +549,10 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 转义RediSearch查询中的特殊字符
+     * 转义RediSearch查询中的特殊字符，避免语法错误
+     * RediSearch特殊字符需要转义: ,.<>{}[]"':;!@#$%^&*()-+=~
+     * @param query 原始查询字符串
+     * @return 转义后的字符串
      */
     private String escapeQuery(String query) {
         if (query == null || query.isEmpty()) {
@@ -515,6 +564,10 @@ public class HybridRerankRetriever implements ContentRetriever {
 
     /**
      * 优化的分词工具方法：中文分词 + 英文缩写保护
+     * 先提取保护英文/数字组合（如E-204故障代码），再对中文部分进行分词
+     * 避免故障代码如ORU被错误拆分，提高检索准确性
+     * @param text 原始查询文本
+     * @return 分词后的关键词列表
      */
     private List<String> tokenizeQuery(String text) {
         if (StringUtils.isBlank(text)) return Collections.emptyList();
@@ -572,7 +625,10 @@ public class HybridRerankRetriever implements ContentRetriever {
     }
 
     /**
-     * 简单的停用词判断 (可根据需要扩展)
+     * 简单的停用词判断，过滤掉无意义的虚词
+     * 可根据风电领域的具体需求进一步扩展停用词表
+     * @param term 分词后的词语
+     * @return 是否是停用词
      */
     private boolean isStopWord(String term) {
         // 单字且不是英文/数字，通常是停用词或噪音

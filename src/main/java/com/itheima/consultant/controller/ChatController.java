@@ -2,7 +2,6 @@ package com.itheima.consultant.controller;
 
 import com.itheima.consultant.aiservice.WindFarmAssistant;
 import com.itheima.consultant.config.DegradationConfig;
-import com.itheima.consultant.dto.ChatResponse;
 import com.itheima.consultant.service.ChatMessageProducer;
 import com.itheima.consultant.service.DegradationService;
 import com.itheima.consultant.service.RagCacheService;

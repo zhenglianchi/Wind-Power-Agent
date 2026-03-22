@@ -8,6 +8,11 @@ import dev.langchain4j.service.spring.AiServiceWiringMode;
 import org.springframework.stereotype.Component;
 import reactor.core.publisher.Flux;
 
+/**
+ * 风电场AI助手接口
+ * 基于langchain4j的AiService自动实现，整合了RAG检索、工具调用和对话记忆
+ * 作为专业的风电运维专家助手，能回答故障排查、技术参数、运维流程等问题
+ */
 @AiService(
         wiringMode = AiServiceWiringMode.EXPLICIT,
         chatModel = "openAiChatModel",

@@ -13,22 +13,36 @@ import org.springframework.stereotype.Service;
 
 import java.util.concurrent.CompletableFuture;
 
+/**
+ * 聊天消息消费者
+ * 从RabbitMQ消息队列接收聊天请求，调用AI助手生成回答，然后将响应发回
+ * 采用异步消费模式，实现请求削峰填谷，支持流量控制和降级
+ */
 @Slf4j
 @Service
 public class ChatMessageConsumer {
 
+    // 风电场AI助手，核心对话服务
     @Autowired
     private WindFarmAssistant windFarmAssistant;
 
+    // RAG缓存服务，缓存常见问题答案，提高响应速度
     @Autowired
     private RagCacheService ragCacheService;
 
+    // 降级服务，系统负载过高时自动降级，保证可用性
     @Autowired
     private DegradationService degradationService;
 
+    // RabbitMQ模板，用于发送响应回消息队列
     @Autowired
     private RabbitTemplate rabbitTemplate;
 
+    /**
+     * 监听聊天请求队列，处理 incoming 聊天请求
+     * 处理流程：降级检查 → 缓存查询 → AI回答 → 缓存写入 → 发送响应
+     * @param message 聊天消息
+     */
     @RabbitListener(queues = RabbitMQConfig.CHAT_QUEUE)
     public void handleChatRequest(ChatMessage message) {
         log.info("📨 [消息队列] 收到聊天请求: messageId={}, memoryId={}",
@@ -89,6 +103,11 @@ public class ChatMessageConsumer {
         }
     }
 
+    /**
+     * 监听死信队列，处理消费失败的消息
+     * 进行有限次重试，超过最大重试次数后丢弃
+     * @param message 死信消息
+     */
     @RabbitListener(queues = RabbitMQConfig.CHAT_DLQ)
     public void handleDeadLetter(ChatMessage message) {
         log.error("💀 [死信队列] 收到死信消息: messageId={}, retryCount={}",
@@ -109,6 +128,10 @@ public class ChatMessageConsumer {
         }
     }
 
+    /**
+     * 发送响应回消息队列
+     * @param response 聊天响应
+     */
     private void sendResponse(ChatResponse response) {
         try {
             rabbitTemplate.convertAndSend(
